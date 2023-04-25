@@ -6,3 +6,7 @@ My ARM study
 
 ## tinalinux gcc  
 * https://github.com/tinalinux/prebuilt/tree/r16-v2.1.y/gcc/linux-x86/arm/toolchain-sunxi-arm9-glibc  
+* https://wiki.banana-pi.org/Tina_Linux  
+
+## bpi d1, arm9  
+* https://wiki.banana-pi.org/Banana_PI_D1  
