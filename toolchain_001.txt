@@ -1,0 +1,1396 @@
+https://preshing.com/20141119/how-to-build-a-gcc-cross-compiler/
+
+Preshing on ProgrammingPreshing on Programming
+TwitterRSSBlogArchivesAboutContact
+NOV 19, 2014
+
+How to Build a GCC Cross-Compiler
+GCC is not just a compiler. It’s an open source project that lets you build all kinds of compilers. Some compilers support multithreading; some support shared libraries; some support multilib. It all depends on how you configure the compiler before building it.
+
+This guide will demonstrate how to build a cross-compiler, which is a compiler that builds programs for another machine. All you need is a Unix-like environment with a recent version of GCC already installed.
+
+
+
+In this guide, I’ll use Debian Linux to build a full C++ cross-compiler for AArch64, a 64-bit instruction set available in the latest ARM processors. I don’t actually own an AArch64 device – I just wanted an AArch64 compiler to verify this bug.
+
+Required Packages
+Starting with a clean Debian system, you must first install a few packages:
+
+$ sudo apt-get install g++ make gawk
+Everything else will be built from source. Create a new directory somewhere, and download the following source packages. (If you’re following this guide at a later date, there will be more recent releases of each package available. Check for newer releases by pasting each URL into your browser without the filename. For example: http://ftpmirror.gnu.org/binutils/)
+
+$ wget http://ftpmirror.gnu.org/binutils/binutils-2.24.tar.gz
+$ wget http://ftpmirror.gnu.org/gcc/gcc-4.9.2/gcc-4.9.2.tar.gz
+$ wget https://www.kernel.org/pub/linux/kernel/v3.x/linux-3.17.2.tar.xz
+$ wget http://ftpmirror.gnu.org/glibc/glibc-2.20.tar.xz
+$ wget http://ftpmirror.gnu.org/mpfr/mpfr-3.1.2.tar.xz
+$ wget http://ftpmirror.gnu.org/gmp/gmp-6.0.0a.tar.xz
+$ wget http://ftpmirror.gnu.org/mpc/mpc-1.0.2.tar.gz
+$ wget ftp://gcc.gnu.org/pub/gcc/infrastructure/isl-0.12.2.tar.bz2
+$ wget ftp://gcc.gnu.org/pub/gcc/infrastructure/cloog-0.18.1.tar.gz
+The first four packages – Binutils, GCC, the Linux kernel and Glibc – are the main ones. We could have installed the next three packages in binary form using our system’s package manager instead, but that tends to provide older versions. The last two packages, ISL and CLooG, are optional, but they enable a few more optimizations in the compiler we’re about to build.
+
+How The Pieces Fit Together
+By the time we’re finished, we will have built each of the following programs and libraries. First, we’ll build the tools on the left, then we’ll use those tools to build the programs and libraries on the right. We won’t actually build the target system’s Linux kernel, but we do need the kernel header files in order to build the target system’s standard C library.
+
+
+
+The compilers on the left will invoke the assembler & linker as part of their job. All the other packages we downloaded, such as MPFR, GMP and MPC, will be linked into the compilers themselves.
+
+The diagram on the right represents a sample program, a.out, running on the target OS, built using the cross compiler and linked with the target system’s standard C and C++ libraries. The standard C++ library makes calls to the standard C library, and the C library makes direct system calls to the AArch64 Linux kernel.
+
+Note that instead of using Glibc as the standard C library implementation, we could have used Newlib, an alternative implementation. Newlib is a popular C library implementation for embedded devices. Unlike Glibc, Newlib doesn’t require a complete OS on the target system – just a thin hardware abstraction layer called Libgloss. Newlib doesn’t have regular releases; instead, you’re meant to pull the source directly from the Newlib CVS repository. One limitation of Newlib is that currently, it doesn’t seem to support building multithreaded programs for AArch64. That’s why I chose not to use it here.
+
+Build Steps
+Extract all the source packages.
+
+$ for f in *.tar*; do tar xf $f; done
+Create symbolic links from the GCC directory to some of the other directories. These five packages are dependencies of GCC, and when the symbolic links are present, GCC’s build script will build them automatically.
+
+$ cd gcc-4.9.2
+$ ln -s ../mpfr-3.1.2 mpfr
+$ ln -s ../gmp-6.0.0 gmp
+$ ln -s ../mpc-1.0.2 mpc
+$ ln -s ../isl-0.12.2 isl
+$ ln -s ../cloog-0.18.1 cloog
+$ cd ..
+Choose an installation directory, and make sure you have write permission to it. In the steps that follow, I’ll install the new toolchain to /opt/cross.
+
+$ sudo mkdir -p /opt/cross
+$ sudo chown jeff /opt/cross
+Throughout the entire build process, make sure the installation’s bin subdirectory is in your PATH environment variable. You can remove this directory from your PATH later, but most of the build steps expect to find aarch64-linux-gcc and other host tools via the PATH by default.
+
+$ export PATH=/opt/cross/bin:$PATH
+Pay particular attention to the stuff that gets installed under /opt/cross/aarch64-linux/. This directory is considered the system root of an imaginary AArch64 Linux target system. A self-hosted AArch64 Linux compiler could, in theory, use all the headers and libraries placed here. Obviously, none of the programs built for the host system, such as the cross-compiler itself, will be installed to this directory.
+
+1. Binutils
+This step builds and installs the cross-assembler, cross-linker, and other tools.
+
+$ mkdir build-binutils
+$ cd build-binutils
+$ ../binutils-2.24/configure --prefix=/opt/cross --target=aarch64-linux --disable-multilib
+$ make -j4
+$ make install
+$ cd ..
+We’ve specified aarch64-linux as the target system type. Binutils’s configure script will recognize that this target is different from the machine we’re building on, and configure a cross-assembler and cross-linker as a result. The tools will be installed to /opt/cross/bin, their names prefixed by aarch64-linux-.
+--disable-multilib means that we only want our Binutils installation to work with programs and libraries using the AArch64 instruction set, and not any related instruction sets such as AArch32.
+2. Linux Kernel Headers
+This step installs the Linux kernel header files to /opt/cross/aarch64-linux/include, which will ultimately allow programs built using our new toolchain to make system calls to the AArch64 kernel in the target environment.
+
+$ cd linux-3.17.2
+$ make ARCH=arm64 INSTALL_HDR_PATH=/opt/cross/aarch64-linux headers_install
+$ cd ..
+We could even have done this before installing Binutils.
+The Linux kernel header files won’t actually be used until step 6, when we build the standard C library, although the configure script in step 4 expects them to be already installed.
+Because the Linux kernel is a different open-source project from the others, it has a different way of identifying the target CPU architecture: ARCH=arm64
+All of the remaining steps involve building GCC and Glibc. The trick is that there are parts of GCC which depend on parts of Glibc already being built, and vice versa. We can’t build either package in a single step; we need to go back and forth between the two packages and build their components in a way that satisfies their dependencies.
+
+
+
+3. C/C++ Compilers
+This step will build GCC’s C and C++ cross-compilers only, and install them to /opt/cross/bin. It won’t invoke those compilers to build any libraries just yet.
+
+$ mkdir -p build-gcc
+$ cd build-gcc
+$ ../gcc-4.9.2/configure --prefix=/opt/cross --target=aarch64-linux --enable-languages=c,c++ --disable-multilib
+$ make -j4 all-gcc
+$ make install-gcc
+$ cd ..
+Because we’ve specified --target=aarch64-linux, the build script looks for the Binutils cross-tools we built in step 1 with names prefixed by aarch64-linux-. Likewise, the C/C++ compiler names will be prefixed by aarch64-linux-.
+--enable-languages=c,c++ prevents other compilers in the GCC suite, such as Fortran, Go or Java, from being built.
+4. Standard C Library Headers and Startup Files
+In this step, we install Glibc’s standard C library headers to /opt/cross/aarch64-linux/include. We also use the C compiler built in step 3 to compile the library’s startup files and install them to /opt/cross/aarch64-linux/lib. Finally, we create a couple of dummy files, libc.so and stubs.h, which are expected in step 5, but which will be replaced in step 6.
+
+$ mkdir -p build-glibc
+$ cd build-glibc
+$ ../glibc-2.20/configure --prefix=/opt/cross/aarch64-linux --build=$MACHTYPE --host=aarch64-linux --target=aarch64-linux --with-headers=/opt/cross/aarch64-linux/include --disable-multilib libc_cv_forced_unwind=yes
+$ make install-bootstrap-headers=yes install-headers
+$ make -j4 csu/subdir_lib
+$ install csu/crt1.o csu/crti.o csu/crtn.o /opt/cross/aarch64-linux/lib
+$ aarch64-linux-gcc -nostdlib -nostartfiles -shared -x c /dev/null -o /opt/cross/aarch64-linux/lib/libc.so
+$ touch /opt/cross/aarch64-linux/include/gnu/stubs.h
+$ cd ..
+--prefix=/opt/cross/aarch64-linux tells Glibc’s configure script where it should install its headers and libraries. Note that it’s different from the usual --prefix.
+Despite some contradictory information out there, Glibc’s configure script currently requires us to specify all three --build, --host and --target system types.
+$MACHTYPE is a predefined environment variable which describes the machine running the build script. --build=$MACHTYPE is needed because in step 6, the build script will compile some additional tools which run as part of the build process itself.
+--host has a different meaning here than we’ve been using so far. In Glibc’s configure, both the --host and --target options are meant to describe the system on which Glibc’s libraries will ultimately run.
+We install the C library’s startup files, crt1.o, crti.o and crtn.o, to the installation directory manually. There’s doesn’t seem to a make rule that does this without having other side effects.
+5. Compiler Support Library
+This step uses the cross-compilers built in step 3 to build the compiler support library. The compiler support library contains some C++ exception handling boilerplate code, among other things. This library depends on the startup files installed in step 4. The library itself is needed in step 6. Unlike some other guides, we don’t need to re-run GCC’s configure. We’re just building additional targets in the same configuration.
+
+$ cd build-gcc
+$ make -j4 all-target-libgcc
+$ make install-target-libgcc
+$ cd ..
+Two static libraries, libgcc.a and libgcc_eh.a, are installed to /opt/cross/lib/gcc/aarch64-linux/4.9.2/.
+A shared library, libgcc_s.so, is installed to /opt/cross/aarch64-linux/lib64.
+6. Standard C Library
+In this step, we finish off the Glibc package, which builds the standard C library and installs its files to /opt/cross/aarch64-linux/lib/. The static library is named libc.a and the shared library is libc.so.
+
+$ cd build-glibc
+$ make -j4
+$ make install
+$ cd ..
+7. Standard C++ Library
+Finally, we finish off the GCC package, which builds the standard C++ library and installs it to /opt/cross/aarch64-linux/lib64/. It depends on the C library built in step 6. The resulting static library is named libstdc++.a and the shared library is libstdc++.so.
+
+$ cd build-gcc
+$ make -j4
+$ make install
+$ cd ..
+Dealing with Build Errors
+If you encounter any errors during the build process, there are three possibilities:
+
+You’re missing a required package or tool on the build system.
+You’re attempting to perform the build steps in an incorrect order.
+You’ve done everything right, but something is just broken in the configuration you’re attempting to build.
+You’ll have to examine the build logs to determine which case applies. GCC supports a lot of configurations, and some of them may not build right away. The less popular a configuration is, the greater the chance of it being broken. GCC, being an open source project, depends on contributions from its users to keep each configuration working.
+
+Automating the Above Steps
+I’ve written a small bash script named build_cross_gcc to perform all of the above steps. You can find it on GitHub. On my Core 2 Quad Q9550 Debian machine, it takes 13 minutes from start to finish. Customize it to your liking before running.
+
+
+
+build_cross_gcc also supports Newlib configurations. When you build a Newlib-based cross-compiler, steps 4, 5 and 6 above can be combined into a single step. (Indeed, that’s what many existing guides do.) For Newlib support, edit the script options as follows:
+
+TARGET=aarch64-elf
+USE_NEWLIB=1
+CONFIGURATION_OPTIONS="--disable-multilib --disable-threads"
+Another way to build a GCC cross-compiler is using a combined tree, where the source code for Binutils, GCC and Newlib are merged into a single directory. A combined tree will only work if the intl and libiberty libraries bundled with GCC and Binutils are identical, which is not the case for the versions used in this post. Combined trees don’t support Glibc either, so it wasn’t an option for this configuration.
+
+There are a couple of popular build scripts, namely crosstool-NG and EmbToolkit, which automate the entire process of building cross-compilers. I had mixed results using crosstool-NG, but it helped me make sense of the build process while putting together this guide.
+
+Testing the Cross-Compiler
+If everything built successfully, let’s check our cross-compiler for a dial tone:
+
+$ aarch64-linux-g++ -v
+Using built-in specs.
+COLLECT_GCC=aarch64-linux-g++
+COLLECT_LTO_WRAPPER=/opt/cross/libexec/gcc/aarch64-linux/4.9.2/lto-wrapper
+Target: aarch64-linux
+Configured with: ../gcc-4.9.2/configure --prefix=/opt/cross --target=aarch64-linux --enable-languages=c,c++ --disable-multilib
+Thread model: posix
+gcc version 4.9.2 (GCC)
+We can compile the C++14 program from the previous post, then disassemble it:
+
+$ aarch64-linux-g++ -std=c++14 test.cpp
+$ aarch64-linux-objdump -d a.out
+...
+0000000000400830 <main>:
+  400830:       a9be7bfd        stp     x29, x30, [sp,#-32]!
+  400834:       910003fd        mov     x29, sp
+  400838:       910063a2        add     x2, x29, #0x18
+  40083c:       90000000        adrp    x0, 400000 <_init-0x618>
+  ...
+This was my first foray into building a cross-compiler. I basically wrote this guide to remember what I’ve learned. I think the above steps serve as a pretty good template for building other configurations; I used build_cross_gcc to build TARGET=powerpc-eabi as well. You can browse config.sub from any of the packages to see what other target environments are supported. Comments and corrections are more than welcome!
+
+« How to Install the Latest GCC on WindowsFixing GCC's Implementation of memory_order_consume »
+Comments (88)
+Commenting Disabled
+Further commenting on this page has been disabled by the blog admin.
+theinvisiblephantom's avatar - Go to profile
+theinvisiblephantom· 440 weeks ago
+
+Wheeeeeeeee! http://wiki.osdev.org/GCC_Cross-Compiler
+Reply1 reply · active 384 weeks ago
+preshing's avatar - Go to profile
+preshing· 440 weeks ago
+
+That guide helped me, but it's meant for compiling an OS kernel. It stops before building the standard C/C++ libraries, which introduce several gotchas.
+Reply
+Felipe's avatar
+Felipe· 440 weeks ago
+
+I want to congratulate you, that is not a simple task at all!
+I could never have done it myself.
+
+Thank you for sharing it!
+Reply
+R Samuel Klatchko's avatar
+R Samuel Klatchko· 440 weeks ago
+
+Nice article. One minor nit is you have your args to 'ln -s' reversed.
+Reply1 reply · active 440 weeks ago
+preshing's avatar - Go to profile
+preshing· 440 weeks ago
+
+Thanks for the catch! Fixed now.
+Reply
+jamie's avatar
+jamie· 437 weeks ago
+
+great work
+Reply
+rbh's avatar
+rbh· 436 weeks ago
+
+Great work! Now if I could only use it to build an armv8a cross-compiler for a linux kernel with c++11 support from the compiler... However, not matter what TARGET and LINUX_ARCH I try, I get a failed command when I get to make all-gcc.
+Reply
+brucedawson's avatar - Go to profile
+brucedawson· 433 weeks ago
+
+> I basically wrote this guide to remember what I’ve learned.
+
+I know that feeling. Some of my posts are done very intentionally for that purpose, and others end up being references when I didn't expect that.
+Reply
+Abdelghani Ouchabane's avatar
+Abdelghani Ouchabane· 433 weeks ago
+
+Great, thanks a lot.
+Reply
+JCarlos's avatar
+JCarlos· 433 weeks ago
+
+Hi I was following your guide to see if I can build a cross compiler for a guruplug display and then one for the RPi both with Arch Linux. But after the "make install-gcc" I got the following errors:
+
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c: In function ‘void compute_bounds_for_param(scop_p, int, __mpz_struct*, __mpz_struct*)’:
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:874:3: error: ‘isl_int’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:874:11: error: expected ‘;’ before ‘v’
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:880:17: error: ‘v’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:880:18: error: ‘isl_int_init’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:881:38: error: ‘isl_set_min’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:882:26: error: ‘isl_int_get_gmp’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:883:38: error: ‘isl_set_max’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:885:19: error: ‘isl_int_clear’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c: In function ‘void compute_bounds_for_loop(clast_for*, __mpz_struct*, __mpz_struct*)’:
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:904:3: error: ‘isl_int’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:904:11: error: expected ‘;’ before ‘isl_value’
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:905:8: error: use of enum ‘isl_lp_result’ without previous declaration
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:905:31: error: invalid type in declaration before ‘;’ token
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:914:17: error: ‘isl_value’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:914:26: error: ‘isl_int_init’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:916:57: error: ‘isl_set_min’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:917:3: error: ‘isl_lp_ok’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:918:34: error: ‘isl_int_get_gmp’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:920:57: error: ‘isl_set_max’ was not declared in this scope
+../../gcc-4.9.2/gcc/graphite-clast-to-gimple.c:924:27: error: ‘isl_int_clear’ was not declared in this scope
+make[1]: *** [graphite-clast-to-gimple.o] Error 1
+make[1]: Leaving directory `/home/crossusr/src-devel/build-gcc/gcc'
+make: *** [install-gcc] Error 2
+
+I don't know if you can help me, this is just for educational purposes but I might use it in future serious projects and will be a great tool to learn.
+
+I have theories on the problem. The gcc version installed is older that the one I'm trying to compile, I'm using a different target in this case "arm-marvell-linux-gnueabi". I really don't know what to do, I'll try and follow the steps first with the architecture you are using and see if the same happens.
+
+Regards.
+Reply2 replies · active 425 weeks ago
+Jordan's avatar - Go to profile
+Jordan· 426 weeks ago
+
+I myself have been trying to build gcc and have come across the same issue. The problem is that the installed version of ISL is not compatible with GCC, or it's not installed at all. I believe there are two or three ways to get past the issue...
+
+If you are using the provided GNU Autotools configure script and don't need ISL support, you can try the option "--without-isl". Not sure if this will work. I tested it and it configured for me but I haven't tried building it this way yet.
+
+Newer versions of ISL have a sub-directory under the headers directory called "deprecated" (i.e. "include/isl/deprecated"). Some of the items that your compiler reported as undefined are defined in headers located there. For example, "isl_int" is defined in the file "include/isl/deprecated/int.h". So, just add the preprocessor include statement "#include <isl/deprecated/int.h>" to the files that require it, such as "gcc/graphite-clast-to-gimple.c".
+
+The other option would be to replace the deprecated functions and objects with the new ones. For example, "isl_int" has been replaced by "isl_val". I am currently trying to do this to build GCC on my Windows system with MinGW. Hopefully I'll be able to create some patches and send them upstream to the developers. The changes have been listed in the changelog and can be viewed here: http://isl.gforge.inria.fr/user.html#Changes-sinc.... However, I am still having trouble figuring out how to replace some items such as "isl_set_max". I don't see a clear way to do this in the documentation.
+
+I hope one of these methods helps you.
+Reply
+pf4public's avatar
+pf4public· 425 weeks ago
+
+See this answer: http://stackoverflow.com/questions/28535896/recip...
+Reply
+Denis's avatar
+Denis· 431 weeks ago
+
+Thanks!
+How to build native compiler gcc for other hardware system(for example, host - x86, native - arm)?
+Reply
+@_Mickael_B's avatar - Go to profile
+@_Mickael_B· 430 weeks ago
+
+Hello ! First I want to thank you about your great explanations in this post. Now I understand better cross-compiler.
+
+I have a question, how do you get this command working ?
+$ make -j4 all-target-libgcc
+$ make install-target-libgcc
+
+In my Makefile I only have these possibilites:
+.PHONY: all-target
+
+all-target: maybe-all-target-libstdc++-v3
+all-target: maybe-all-target-libmudflap
+all-target: maybe-all-target-libssp
+all-target: maybe-all-target-newlib
+all-target: maybe-all-target-libgfortran
+all-target: maybe-all-target-libobjc
+all-target: maybe-all-target-libtermcap
+all-target: maybe-all-target-winsup
+all-target: maybe-all-target-libgloss
+all-target: maybe-all-target-libiberty
+all-target: maybe-all-target-gperf
+all-target: maybe-all-target-examples
+all-target: maybe-all-target-libffi
+all-target: maybe-all-target-libjava
+all-target: maybe-all-target-zlib
+all-target: maybe-all-target-boehm-gc
+all-target: maybe-all-target-qthreads
+all-target: maybe-all-target-rda
+all-target: maybe-all-target-libada
+all-target: maybe-all-target-libgomp
+
+Did I miss something ? (My cross-compiler version is gcc-4.2.4)
+
+Thank you.
+Reply
+PF4Public's avatar
+PF4Public· 429 weeks ago
+
+Great post indeed. My addition is that you should mention as it is done at osdev:
+Note: Version 0.13 (or later) of ISL is incompatible with the current CLooG 0.18.1 release (and older). Use version 0.12.2 of ISL or the build will fail
+Reply1 reply · active 425 weeks ago
+pf4public's avatar
+pf4public· 425 weeks ago
+
+Recently CLooG got compatible with ISL 0.14. However ISL 0.14 is not compatible with gcc-4.9.2. So that working latest combination would be: isl-0.12.2 and cloog-0.18.2. Also see the answer here: http://stackoverflow.com/questions/28535896/recip...
+Reply
+Dean Matsen's avatar
+Dean Matsen· 428 weeks ago
+
+This guide helped me immensely. I have figured this out in a previous life, but forgot a lot of details.
+
+With the way glibc is configured in the example, when you run programs in the target, the ld.so program will be looking for .so files in /opt/cross/aarch64-linux/...
+Usually, one wants .so files to come from /lib. A Raspberry Pi probably doesn't do cross compiling for other targets, right?
+
+Now, I know someone is going to say "well, then use ldconfig or an LD_LIBRARY_PATH", but I'm not sure this would help the problem I had, which is that the kernel couldn't even load init. I got the usual "error while loading shared libraries: libc.so.6: cannot open shared object file: No such file or directory". In any case, it's kind of questionable to have the default directory set to /opt/cross/aarch64-linux/... in your ld.so, even if you can override it.
+
+The solution I used is to specify a blank prefix at glibc configuration time, and specify a prefix only when doing "make install". In the example above, this translates to:
+
+$ ../glibc-2.20/configure --prefix= --build=$MACHTYPE --host=aarch64-linux --target=aarch64-linux --with-headers=/opt/cross/aarch64-linux/include --disable-multilib libc_cv_forced_unwind=yes
+$ make prefix=/opt/cross/aarch64-linux install-bootstrap-headers=yes install-headers
+
+and later on in step 6:
+
+$ make prefix=/opt/cross/aarch64-linux install
+
+I guess it could be said that in addition to --target=, --host=, and --build=, glibc's prefix= has a different implication from that of gcc and binutils.
+
+OTHER NOTES:
+
+I see many people asking questions about how to diagnose problems. Here are some things I discovered by troubleshooting problems with my own cross compiler:
+
+1. If you define LD_DEBUG=libs, then ld.so will chat about what's doing when it tries to load files.
+
+2. ld.so is a program. You can say
+
+$ /lib/ld-linux.so.3
+
+or
+
+$ /lib/ld-<version>.so
+
+and it will spit out a usage clause. Specifically, you can try your new ld-<newversion>.so in a running system while using your old ld-<oldversion>.so by doing something like
+
+$ /lib/ld-<newversion>.so --list <program>
+
+shows where ld.so is trying to find all the files <program> depends on, which may give you hints on where paths might be wrong etc.
+
+3. If you want your new ld.so to be able to load .so files from both /lib and /usr/lib, there is a secret backdoor in the glibc makefile. In step 6 of the guide, use the make command
+
+$ make -j 4 user-defined-trusted-dirs="/usr/lib"
+
+which adds "/usr/lib" to the default of just "/lib". user-defined-trusted-dirs can be a space separated list of directories if you want to add more.
+Reply1 reply · active 384 weeks ago
+Luke Kim's avatar
+Luke Kim· 384 weeks ago
+
+I have similar issue and I resolved different way.
+I passed '--prefix=/usr' to 'configure'
+and I passed 'install_root=/opt/cross/aarch64-linux' when 'make install'
+It created proper path in libc.so and others.
+Reply
+Alex's avatar
+Alex· 426 weeks ago
+
+This is an awesome guide. I've been looking around for a while for how to accomplish this (on my own, I eventually got caught in the libgcc/glibc circular dependency, and couldn't find my way out). All the other stuff online is from pre-2008, much outdated! Thank you!
+Reply
+silvers's avatar
+silvers· 426 weeks ago
+
+Thanks for your guideline!
+
+I do same as the post on centos 6.5 and it worked like a charm.
+But when i try compile a .cpp file (from your another post too) by aarch64-linux-g++, it throw error that cannot find iostream
+
+Can you help me ?
+Reply
+stemsee's avatar
+stemsee· 426 weeks ago
+
+You are a great teacher. Such clarity and order. Thank you very much!
+
+stemsee
+Reply
+Allen Wan's avatar
+Allen Wan· 425 weeks ago
+
+Great guide indeed.
+But I got stuck at Step 4, while doing #make csu/subdir_lib.
+output as following:
+***************
+libc-start.c: In function ‘__libc_start_main’:
+libc-start.c:279:30: error: implicit declaration of function ‘__builtin_thread_pointer’ [-Werror=implicit-function-declaration]
+libc-start.c:279:30: error: cast to pointer from integer of different size [-Werror=int-to-pointer-cast]
+libc-start.c:314:7: error: implicit declaration of function ‘__atomic_fetch_add’ [-Werror=implicit-function-declaration]
+libc-start.c:314:1: error: ‘__ATOMIC_ACQUIRE’ undeclared (first use in this function)
+libc-start.c:314:1: note: each undeclared identifier is reported only once for each function it appears in
+cc1: all warnings being treated as errors
+make[2]: *** [/home/allen/local/gcc/build-glibc/csu/libc-start.o] Error 1
+make[2]: Leaving directory `/home/allen/local/gcc/glibc-2.21/csu'
+make[1]: *** [csu/subdir_lib] Error 2
+make[1]: Leaving directory `/home/allen/local/gcc/glibc-2.21'
+make: *** [csu/subdir_lib] Error 2
+*******
+It seems some head file not included.
+Could you provide any clue?
+Reply2 replies · active 381 weeks ago
+strangerinpatmos's avatar - Go to profile
+strangerinpatmos· 419 weeks ago
+
+I'm having the same issue, trying to compile it on Ubuntu 14.04. What system are you using?
+Reply
+chirag's avatar
+chirag· 381 weeks ago
+
+Hi,Allen i'm getting same error .
+can you tell me how to fix it?
+Reply
+Jonathan Edwards's avatar
+Jonathan Edwards· 425 weeks ago
+
+So I've pretty much followed this gude, but when I get to the point of testing the compiler there are a lot of C runtime functions missing (__libc_csu_init, __libc_csu_ini, puts).
+
+The mising __libc functions mak eme wonder aobut the -nostartfiles option when libc.so is created in step 4, and I'm wondering if perhaps I need to do something extra to make sure the proper libc is really built in step 6...
+Reply1 reply · active 424 weeks ago
+Jonathan Edwards's avatar
+Jonathan Edwards· 424 weeks ago
+
+Erm....
+
+I really can't be blamed for doing step 6 in build-gcc instead of build-glibc.
+
+They look so much alike.....
+
+Much better now.
+Reply
+Paras's avatar
+Paras· 420 weeks ago
+
+Hi, I tried following your guide. The explanation seems very easy to understand. but I am getting following error in step 1 in the "make -j4" command. :-
+make[3]: Nothing to be done for 'info'.
+make[3]: Leaving directory '/home/paras/crossbuild/build-binutils/bfd/po'
+make[3]: Entering directory '/home/paras/crossbuild/build-binutils/bfd'
+make[3]: Nothing to be done for 'info-am'.
+make[3]: Leaving directory '/home/paras/crossbuild/build-binutils/bfd'
+Makefile:1647: recipe for target 'info-recursive' failed
+make[2]: *** [info-recursive] Error 1
+make[2]: Leaving directory '/home/paras/crossbuild/build-binutils/bfd'
+Makefile:2600: recipe for target 'all-bfd' failed
+make[1]: *** [all-bfd] Error 2
+make[1]: Leaving directory '/home/paras/crossbuild/build-binutils'
+Makefile:832: recipe for target 'all' failed
+make: *** [all] Error 2.
+I tried using the latest release of binutils 2.25 but it give same error.
+Reply1 reply · active 418 weeks ago
+Guest's avatar
+Guest· 418 weeks ago
+
+Hi Paras. I'm facing the same problem. Can you please tell me what did you do to solve this problem ?
+Reply
+Paras's avatar
+Paras· 419 weeks ago
+
+Hi, thanks for such a wonderful guide. It did helped me alot. I wanted to ask that do we have to build this everytime because when I close my terminal or open a new terminal and check for a dialer to by executing $ aarch64-linux-g++ -v . It says aarch64-linux-g++: command not found.
+Is there anything I can do to persist the build.
+Reply2 replies · active 418 weeks ago
+preshing's avatar - Go to profile
+preshing· 418 weeks ago
+
+Just re-run: export PATH=/opt/cross/bin:$PATH
+Or add it to your startup script.
+Reply
+Paras's avatar
+Paras· 418 weeks ago
+
+Thanks. It did worked.
+Reply
+Les's avatar
+Les· 418 weeks ago
+
+Can you specify the changes you made to build_cross_gcc for powerpc-eabi. I keep getting an error when I get to the configure part of GLIBC, "The GNU C library is currently not available for this platform..." The configure command is
+
+../$GLIBC_VERSION/configure --prefix=$INSTALL_PATH/$TARGET --build=$MACHTYPE --host=x86_64 --target=$TARGET --with-headers=$INSTALL_PATH/$TARGET/include $CONFIGURATION_OPTIONS libc_cv_forced_unwind=yes
+
+Where $TARGET is set to powerpc-eabi.
+
+What am I doing wrong
+Reply1 reply · active 379 weeks ago
+Angel's avatar
+Angel· 379 weeks ago
+
+I get the same error (with TARGET=powerpc-ibm-aix5.3). Has anyone managed to cross-compiled GLibc for AIX? If not, what C library can we use instead?
+Reply
+dcshin's avatar
+dcshin· 417 weeks ago
+
+Hi Jeff,
+Thank you for your kindness guide.
+However, when I did follow your guide, I can see the below error msgs.
+
+-----
+make[2]: Entering directory '/share/CACHEDEV1_DATA/homes/dcshin/workspace/env/glibc-2.21/sunrpc'
+/opt/bin/install -c -m 644 rpc/netdb.h /opt/local/x86_64-unknown-linux-gnu/include/rpc/netdb.h
+gcc -D_RPC_THREAD_SAFE_ -D_GNU_SOURCE -DIS_IN_build -include /share/homes/dcshin/workspace/env/builds/glibc-2.21/config.h rpc_main.c
+-o /share/homes/dcshin/workspace/env/builds/glibc-2.21/sunrpc/cross-rpc_main.o -MMD -MP -MF /share/homes/dcshin/workspace/env/builds/glibc-2.21/sunrpc/cross-rpc_main.o.dt -MT /share/homes/dcshin/workspace/env/builds/glibc-2.21/sunrpc/cross-rpc_main.o -c
+In file included from /opt/local/x86_64-unknown-linux-gnu/include/features.h:389:0,
+from /opt/local/x86_64-unknown-linux-gnu/include/errno.h:28,
+from rpc_main.c:37:
+/opt/include/gnu/stubs.h:9:27: fatal error: gnu/stubs-64.h: No such file or directory
+# include <gnu/stubs-64.h>
+^
+compilation terminated.
+Makefile:163: recipe for target '/share/homes/dcshin/workspace/env/builds/glibc-2.21/sunrpc/cross-rpc_main.o' failed
+make[2]: *** [/share/homes/dcshin/workspace/env/builds/glibc-2.21/sunrpc/cross-rpc_main.o] Error 1
+-----
+
+I'm searching google and I think the file "gnu/stubs-64.h" will be made after building glibc.
+(I have only "gnu/stubs-32.h" for now)
+I'm somewhat confused because this error msg was coming while building glibc
+(4. Standard C Library Headers and Startup Files -> make install-bootstrap-headers=yes install-headers in your guide).
+
+Could you let me know how can I get through this?
+
+Thanks.
+Reply
+Paul's avatar - Go to profile
+Paul· 414 weeks ago
+
+The glibc script seems to work, but when I try using newlib I get the following errors:
+
+/home/vagrant/xc2/mips-linux/bin/ld: cannot find crti.o: No such file or directory
+/home/vagrant/xc2/mips-linux/bin/ld: cannot find -lc
+/home/vagrant/xc2/mips-linux/bin/ld: cannot find crtn.o: No such file or directory
+collect2: error: ld returned 1 exit status
+Makefile:937: recipe for target 'libgcc_s.so' failed
+make[2]: *** [libgcc_s.so] Error 1
+make[2]: Leaving directory '/home/vagrant/build-cross-gcc/build-gcc/mips-linux/libgcc'
+Makefile:12412: recipe for target 'all-target-libgcc' failed
+
+Do I need a similar install line to add crti.o as I do with glibc?
+Reply
+Tino's avatar
+Tino· 413 weeks ago
+
+Something wrong with include files on my end. Did I miss a step?
+
+~/src/testgcc$ aarch64-linux-g++ -std=c++14 test.cpp
+test.cpp:2:20: fatal error: iostream: No such file or directory
+compilation terminated.
+Reply2 replies · active 413 weeks ago
+Tino's avatar
+Tino· 413 weeks ago
+
+Looks like I missed error in step 7:
+
+../../../gcc-5.1.0/libsanitizer/sanitizer_common/sanitizer_platform_limits_posix.cc:134:21: fatal error: rpc/xdr.h: No such file or directory
+compilation terminated.
+
+Don't know where this rpc/xdr.h should come from...
+Reply
+Tino's avatar
+Tino· 413 weeks ago
+
+ok, I just found it out. There is a bug related to this, in gcc 5.1:
+https://gcc.gnu.org/bugzilla/show_bug.cgi?id=6483...
+
+needs to apply patch: https://gist.githubusercontent.com/anonymous/7f23...
+Reply
+Vineel's avatar - Go to profile
+Vineel· 412 weeks ago
+
+Which tool is used for all the illustrations? They look awesome.
+Please share the tools used. Thanks in advance.
+Reply1 reply · active 412 weeks ago
+preshing's avatar - Go to profile
+preshing· 412 weeks ago
+
+Inkscape!
+Reply
+James Burrell's avatar
+James Burrell· 412 weeks ago
+
+I have looked at a number of tutorials on building a cross-compiler, and yours is the first that ever worked! Many thanks!
+Reply
+BigMav's avatar
+BigMav· 405 weeks ago
+
+Thanks for this tutorial.
+I was able to build a linux cross-compiler on cygwin under windows 7 following the steps above.
+I have used binutil 2.25 , gcc 4.9.2 , glibc 2.21 and linux 3.17.
+
+I have tested my x86_64-unknown-linux-gnu-gcc.exe with a simple hello world program and run it on debian 64 bits and it works !
+Reply
+Jagmohan's avatar
+Jagmohan· 404 weeks ago
+
+Hello,
+
+I tried to use these steps and the script for following configuration. I get error in building binutils - "BFD does not support target arm-none-eabi" Can anyone help?
+
+INSTALL_PATH=/home/{PATH}/cortex-m4
+TARGET=arm-none-eabi
+USE_NEWLIB=0
+LINUX_ARCH=arm64
+CONFIGURATION_OPTIONS="--disable-multilib" # --disable-threads --disable-shared
+PARALLEL_MAKE=-j4
+BINUTILS_VERSION=binutils-2.9
+GCC_VERSION=gcc-5.2.0
+LINUX_KERNEL_VERSION=linux-3.19
+GLIBC_VERSION=glibc-2.21
+MPFR_VERSION=mpfr-3.1.3
+GMP_VERSION=gmp-6.0.0a
+MPC_VERSION=mpc-1.0.3
+ISL_VERSION=isl-0.15
+CLOOG_VERSION=cloog-0.18.1
+
+Can you also tell me about the usage of LINUX_ARCH? I am trying to create cross compiler for Cortex M4.
+Reply1 reply · active 404 weeks ago
+Steven Lee's avatar
+Steven Lee· 404 weeks ago
+
+Hello,
+
+I tried to build gcc cross-compiler for arm and I built a cross-compiler succesfully after trial and error.
+
+I used 'target=arm-linux-gnueabi' instead of 'arm-none-eabi'.
+$../binutils-2.24/configure --prefix=$HOME/install/cross --target=arm-linux-gnueabi --disable-multilib
+
+Cortext M4 is arm 32bit processor. So use 'ARCH=arm' instead of arm64 to install linux kernel headers.
+Reply
+Steven Lee's avatar
+Steven Lee· 404 weeks ago
+
+Hello,
+
+Thanks a lot of this guide. It helps me build a gcc cross-compiler for arm. :)
+Reply
+Ramya J's avatar
+Ramya J· 403 weeks ago
+
+When building glibc, I am getting the following error: Can you please tell me how to fix this?
+/opt/cross/lib/gcc/aarch64-linux/4.9.2/../../../../aarch64-linux/bin/ld: cannot find crtbegin.o: No such file or directory
+/opt/cross/lib/gcc/aarch64-linux/4.9.2/../../../../aarch64-linux/bin/ld: cannot find -lgcc
+/opt/cross/lib/gcc/aarch64-linux/4.9.2/../../../../aarch64-linux/bin/ld: cannot find -lgcc_s
+collect2: error: ld returned 1 exit status
+make[2]: *** [/home/build-glibc/sunrpc/cross-rpcgen] Error 1
+make[2]: Leaving directory `/home/glibc-2.20/sunrpc'
+make[1]: *** [sunrpc/install-headers] Error 2
+make[1]: Leaving directory `/home/glibc-2.20'
+make: *** [install-headers] Error 2
+Reply
+Ramya J's avatar
+Ramya J· 402 weeks ago
+
+I solved my previous problem myself. One of the LIBRARY_PATH had to be set. Thank you very much for your blog! Its very well written.
+Reply2 replies · active 355 weeks ago
+James Huang's avatar
+James Huang· 393 weeks ago
+
+Hello Ramya,
+Did you also enable multiilib? I have the similar problem for building x86_64 with --enable-multilib option.
+Did you set LIBRARY_PATH to host library set?
+I am wondering anyway to build gcc multilib from scratch, instead of setting the Library path to host system library (ex. apt-get instal gcc-multilib).
+Reply
+James Huang's avatar
+James Huang· 393 weeks ago
+
+I got the following similar error:
+
+make[2]: Entering directory '/home/james/project/cross_complier/glibc-2.20/sunrpc'
+/usr/bin/install -c -m 644 rpc/netdb.h /opt/cross/x86_64-linux/include/rpc/netdb.h
+x86_64-linux-gcc /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_main.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_hout.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_cout.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_parse.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_scan.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_util.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_svcout.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_clntout.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_tblout.o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpc_sample.o -o /home/james/project/cross_complier/build-glibc/sunrpc/cross-rpcgen
+/opt/cross/lib/gcc/x86_64-linux/4.9.2/../../../../x86_64-linux/bin/ld: cannot find crtbegin.o: No such file or directory
+/opt/cross/lib/gcc/x86_64-linux/4.9.2/../../../../x86_64-linux/bin/ld: cannot find -lgcc
+/opt/cross/lib/gcc/x86_64-linux/4.9.2/../../../../x86_64-linux/bin/ld: cannot find -lgcc_s
+/opt/cross/lib/gcc/x86_64-linux/4.9.2/../../../../x86_64-linux/bin/ld: cannot find -lgcc
+/opt/cross/lib/gcc/x86_64-linux/4.9.2/../../../../x86_64-linux/bin/ld: cannot find -lgcc_s
+/opt/cross/lib/gcc/x86_64-linux/4.9.2/../../../../x86_64-linux/bin/ld: cannot find crtend.o: No such file or directory
+collect2: error: ld returned 1 exit status
+Makefile:167: recipe for target '/home/james/project/cross_complier/build-glibc/sunrpc/cross-rpcgen' failed
+make[2]: *** [/home/james/project/cross_complier/build-glibc/sunrpc/cross-rpcgen] Error 1
+make[2]: Leaving directory '/home/james/project/cross_complier/glibc-2.20/sunrpc'
+Makefile:213: recipe for target 'sunrpc/install-headers' failed
+make[1]: *** [sunrpc/install-headers] Error 2
+make[1]: Leaving directory '/home/james/project/cross_complier/glibc-2.20'
+Makefile:9: recipe for target 'install-headers' failed
+make: *** [install-headers] Error 2
+
+set LD_LIBRARY_PATH include the following directories, still cannot solve the problem.
+ames@james-Aspire-E5-472G:/usr$ find -name libgcc*.*
+./lib32/libgcc_s.so.1
+./lib/ure/lib/libgcc3_uno.so
+./lib/x86_64-linux-gnu/libgccpp.so.1.0.3
+./lib/x86_64-linux-gnu/libgccpp.so.1
+./lib/gcc/x86_64-linux-gnu/4.9/libgcc_s.so
+./lib/gcc/x86_64-linux-gnu/4.9/32/libgcc_s.so
+./lib/gcc/x86_64-linux-gnu/4.9/32/libgcc_eh.a
+./lib/gcc/x86_64-linux-gnu/4.9/32/libgcc.a
+./lib/gcc/x86_64-linux-gnu/4.9/libgcc_eh.a
+./lib/gcc/x86_64-linux-gnu/4.9/x32/libgcc_s.so
+./lib/gcc/x86_64-linux-gnu/4.9/x32/libgcc_eh.a
+./lib/gcc/x86_64-linux-gnu/4.9/x32/libgcc.a
+./lib/gcc/x86_64-linux-gnu/4.9/libgcc_s_x32.so
+./lib/gcc/x86_64-linux-gnu/4.9/libgcc_s_32.so
+./lib/gcc/x86_64-linux-gnu/4.9/libgcc.a
+./libx32/libgcc_s.so.1
+./share/doc/libgcc-4.9-dev
+james@james-Aspire-E5-472G:/usr$ find -name crtbegin.o
+./lib/gcc/x86_64-linux-gnu/4.9/crtbegin.o
+./lib/gcc/x86_64-linux-gnu/4.9/32/crtbegin.o
+./lib/gcc/x86_64-linux-gnu/4.9/x32/crtbegin.o
+james@james-Aspire-E5-472G:/usr$
+
+My target arch= x86_64 with --enable-multilib
+Reply
+Ankur's avatar - Go to profile
+Ankur· 401 weeks ago
+
+I have some questions could you please answer any of these or give some good reference where I could find the answers.
+1. How do you figure out that these steps are necessary to build a toolchain. I read some other articles which were building toolchain following different step for example compiling GCC in two stages, not installing the GLIBC headers.
+2. Does the package version affect the output and process of bulding?
+3. I have compiled my kernel with toolchain X which is running on a board. Now I used another toolchain Y to compile a simple c program or even a driver will it run successfully on the board.
+Reply
+José Adalberto Façanha Gualeve's avatar - Go to profile
+José Adalberto Façanha Gualeve· 395 weeks ago
+
+Hi,
+i tried with:
+
+INSTALL_PATH=/opt/cross_mips
+TARGET=mips-elf
+USE_NEWLIB=1
+LINUX_ARCH=x86_64
+CONFIGURATION_OPTIONS="--disable-multilib --disable-threads --disable-shared"
+PARALLEL_MAKE=-j4
+BINUTILS_VERSION=binutils-2.25
+GCC_VERSION=gcc-4.9.2
+LINUX_KERNEL_VERSION=linux-3.16.7
+GLIBC_VERSION=glibc-2.20
+MPFR_VERSION=mpfr-3.1.2
+GMP_VERSION=gmp-6.0.0a
+MPC_VERSION=mpc-1.0.2
+ISL_VERSION=isl-0.12.2
+CLOOG_VERSION=cloog-0.18.1
+
+Compiled ok, but in test, i got:
+
+$ mips-elf-gcc hello.c -o hello
+/opt/cross_mips/lib/gcc/mips-elf/4.9.2/../../../../mips-elf/bin/ld: warning: cannot find entry symbol _start; defaulting to 0000000000400050
+/tmp/ccUfQpoP.o: In function `main':
+(.text+0x18): undefined reference to `puts'
+collect2: error: ld returned 1 exit status
+
+Ty.
+AFG
+Reply
+juraad's avatar
+juraad· 394 weeks ago
+
+ok!
+ISL_VERSION=isl-0.12.2
+problem
+ISL_VERSION=isl-0.15
+not support
+binutils & gcc
+Reply
+juraad's avatar
+juraad· 394 weeks ago
+
+--disable-isl-version-check
+Reply
+Leopold's avatar
+Leopold· 386 weeks ago
+
+Please, can You update this pretty manual up to latest software versions (and, may be with related patches)?
+Thank You!
+Reply
+Erac's avatar
+Erac· 375 weeks ago
+
+I'm trying to build an i386-elf cross compiler for rustboot, and am getting this error from following these directions:
+
+base@homebase:~/i386crossgcc/build-glibc$ ../glibc-2.20/configure --prefix=/opt/i386cross/i386-elf --build=$MACHTYPE --host=i386-elf --target=i386-elf --with-headers=/opt/i386cross/i386-elf/include --disable-multilib libc_cv_forced_unwind=yes
+
+checking build system type... x86_64-pc-linux-gnu
+checking host system type... i386-pc-elf
+checking for i386-elf-gcc... no
+checking for gcc... gcc
+configure: WARNING: using cross tools not prefixed with host triplet
+checking for suffix of object files... o
+checking whether we are using the GNU C compiler... yes
+checking whether gcc accepts -g... yes
+checking for gcc... gcc
+checking for i386-elf-g++... no
+checking for i386-elf-c++... no
+checking for i386-elf-gpp... no
+checking for i386-elf-aCC... no
+checking for i386-elf-CC... no
+checking for i386-elf-cxx... no
+checking for i386-elf-cc++... no
+checking for i386-elf-cl.exe... no
+checking for i386-elf-FCC... no
+checking for i386-elf-KCC... no
+checking for i386-elf-RCC... no
+checking for i386-elf-xlC_r... no
+checking for i386-elf-xlC... no
+checking for g++... g++
+checking whether we are using the GNU C++ compiler... yes
+checking whether g++ accepts -g... yes
+checking for i386-elf-readelf... no
+checking for readelf... readelf
+checking for sysdeps preconfigure fragments... aarch64 alpha arm hppa i386 m68k microblaze mips powerpc s390 sh sparc tile x86_64
+configure: running configure fragment for add-on libidn
+*** The GNU C library is currently not available for this platform.
+*** So far nobody cared to port it and if there is no volunteer it
+*** might never happen. So, if you have interest to see glibc on
+*** this platform visit
+** *http://www.gnu.org/software/libc/porting.html
+*** and join the group of porters
+
+I'm pretty new to using toolchains for building cross compilers so I'm not sure how to circumvent this problem, even after checking http://www.gnu.org/software/libc/porting.html.
+
+I'm running Ubuntu 14.04 if that helps. Thanks in advance!
+Reply
+venkatesh's avatar
+venkatesh· 370 weeks ago
+
+when i run:
+Standard C Library Headers and Startup Files (5th step)
+Got the following error:
+
+make -j4 csu/subdir_lib
+
+../sysdeps/unix/sysv/linux/aarch64/__read_tp.S:23: Error: no such instruction: `mrs x0,tpidr_el0'
+make[2]: *** [/home/venkatesh/Arm_Cross_Compiler/build-glibc/csu/__read_tp.o] Error 1
+make[2]: *** Waiting for unfinished jobs....
+In file included from ../sysdeps/aarch64/nptl/tls.h:47:0,
+from ../include/link.h:44,
+from ../include/dlfcn.h:4,
+from ../sysdeps/generic/ldsodefs.h:32,
+from ../sysdeps/aarch64/ldsodefs.h:46,
+from ../sysdeps/gnu/ldsodefs.h:46,
+from ../sysdeps/unix/sysv/linux/ldsodefs.h:22,
+from ../sysdeps/unix/sysv/linux/aarch64/ldsodefs.h:22,
+from libc-start.c:22:
+libc-start.c: In function ‘__libc_start_main’:
+../sysdeps/unix/sysv/linux/aarch64/sysdep.h:266:17: error: invalid register name for ‘_x0’
+register long _x0 asm ("x0");
+^
+../sysdeps/unix/sysv/linux/aarch64/sysdep.h:269:3: note: in expansion of macro ‘LOAD_ARGS_0’
+LOAD_ARGS_0 ()
+^
+../sysdeps/unix/sysv/linux/aarch64/sysdep.h:242:8: note: in expansion of macro ‘LOAD_ARGS_1’
+LOAD_ARGS_##nr (args)
+^
+../sysdeps/unix/sysv/linux/aarch64/sysdep.h:252:2: note: in expansion of macro ‘INTERNAL_SYSCALL_RAW’
+INTERNAL_SYSCALL_RAW(SYS_ify(name), err, nr, args)
+^
+../sysdeps/unix/sysv/linux/exit-thread.h:36:7: note: in expansion of macro ‘INTERNAL_SYSCALL’
+INTERNAL_SYSCALL (exit, err, 1, 0);
+^
+../sysdeps/unix/sysv/linux/aarch64/sysdep.h:243:22: error: invalid register name for ‘_x8’
+register long _x8 asm ("x8") = (name);
+^
+../sysdeps/unix/sysv/linux/aarch64/sysdep.h:252:2: note: in expansion of macro ‘INTERNAL_SYSCALL_RAW’
+INTERNAL_SYSCALL_RAW(SYS_ify(name), err, nr, args)
+^
+../sysdeps/unix/sysv/linux/exit-thread.h:36:7: note: in expansion of macro ‘INTERNAL_SYSCALL’
+INTERNAL_SYSCALL (exit, err, 1, 0);
+^
+In file included from ../include/link.h:44:0,
+from ../include/dlfcn.h:4,
+from ../sysdeps/generic/ldsodefs.h:32,
+from ../sysdeps/aarch64/ldsodefs.h:46,
+from ../sysdeps/gnu/ldsodefs.h:46,
+from ../sysdeps/unix/sysv/linux/ldsodefs.h:22,
+from ../sysdeps/unix/sysv/linux/aarch64/ldsodefs.h:22,
+from libc-start.c:22:
+../sysdeps/aarch64/nptl/tls.h:105:46: error: __builtin_thread_pointer is not supported on this target
+((struct pthread *)__builtin_thread_pointer () - 1)
+^
+libc-start.c:279:30: note: in expansion of macro ‘THREAD_SELF’
+struct pthread *self = THREAD_SELF;
+^
+make[2]: *** [/home/venkatesh/Arm_Cross_Compiler/build-glibc/csu/libc-start.o] Error 1
+check_fds.c: Assembler messages:
+check_fds.c:82: Error: no such instruction: `brk '
+make[2]: *** [/home/venkatesh/Arm_Cross_Compiler/build-glibc/csu/check_fds.o] Error 1
+In file included from ../include/errno.h:27:0,
+from ../csu/libc-tls.c:19,
+from ../sysdeps/aarch64/libc-tls.c:19:
+../sysdeps/aarch64/libc-tls.c: In function ‘__tls_get_addr’:
+../sysdeps/aarch64/nptl/tls.h:101:44: error: __builtin_thread_pointer is not supported on this target
+(((tcbhead_t *) __builtin_thread_pointer ())->dtv)
+^
+../sysdeps/aarch64/libc-tls.c:30:16: note: in expansion of macro ‘THREAD_DTV’
+dtv_t *dtv = THREAD_DTV ();
+^
+make[2]: *** [/home/venkatesh/Arm_Cross_Compiler/build-glibc/csu/libc-tls.o] Error 1
+make[2]: Leaving directory `/home/venkatesh/Arm_Cross_Compiler/glibc-2.20/csu'
+make[1]: *** [csu/subdir_lib] Error 2
+make[1]: Leaving directory `/home/venkatesh/Arm_Cross_Compiler/glibc-2.20'
+make: *** [csu/subdir_lib] Error 2
+
+Can anyone help me plz...
+how to resolve this issue.
+Reply4 replies · active 277 weeks ago
+Richard Wicks's avatar
+Richard Wicks· 353 weeks ago
+
+I got the same exact error. Here's my version of GCC if anybody cares to look
+
+$ gcc -v
+Using built-in specs.
+COLLECT_GCC=gcc
+COLLECT_LTO_WRAPPER=/usr/lib/gcc/x86_64-linux-gnu/4.8/lto-wrapper
+Target: x86_64-linux-gnu
+Configured with: ../src/configure -v --with-pkgversion='Ubuntu 4.8.4-2ubuntu1~14.04.3' --with-bugurl=file:///usr/share/doc/gcc-4.8/README.Bugs --enable-languages=c,c++,java,go,d,fortran,objc,obj-c++ --prefix=/usr --program-suffix=-4.8 --enable-shared --enable-linker-build-id --libexecdir=/usr/lib --without-included-gettext --enable-threads=posix --with-gxx-include-dir=/usr/include/c++/4.8 --libdir=/usr/lib --enable-nls --with-sysroot=/ --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --enable-gnu-unique-object --disable-libmudflap --enable-plugin --with-system-zlib --disable-browser-plugin --enable-java-awt=gtk --enable-gtk-cairo --with-java-home=/usr/lib/jvm/java-1.5.0-gcj-4.8-amd64/jre --enable-java-home --with-jvm-root-dir=/usr/lib/jvm/java-1.5.0-gcj-4.8-amd64 --with-jvm-jar-dir=/usr/lib/jvm-exports/java-1.5.0-gcj-4.8-amd64 --with-arch-directory=amd64 --with-ecj-jar=/usr/share/java/eclipse-ecj.jar --enable-objc-gc --enable-multiarch --disable-werror --with-arch-32=i686 --with-abi=m64 --with-multilib-list=m32,m64,mx32 --with-tune=generic --enable-checking=release --build=x86_64-linux-gnu --host=x86_64-linux-gnu --target=x86_64-linux-gnu
+Thread model: posix
+gcc version 4.8.4 (Ubuntu 4.8.4-2ubuntu1~14.04.3)
+Reply
+Aaj's avatar
+Aaj· 304 weeks ago
+
+hey I got the same issue how did you solve it?
+Reply
+nekketsuuu's avatar
+nekketsuuu· 303 weeks ago
+
+@venkatesh, @Richard Wicks,
+
+Do you add /opt/cross/bin/ to $PATH ? This is mentioned before the build step of binutils.
+Reply
+Phoenix591's avatar
+Phoenix591· 277 weeks ago
+
+Had this error too and I figured it out..
+When you add the prefix to your PATH you have to use the.absolute path, eg I had ~/cross/bin added to my path and although bash found it there it seems configure did not, changed it to /home/phoenix/bin and reran configure it and worked.
+Reply
+F.A.'s avatar
+F.A.· 369 weeks ago
+
+Having trouble at step 6 while building glibc:
+/root/gccbuilder/build-glibc/resolv/libresolv_pic.a(ns_print.os): In function `__GI_ns_sprintrrf':
+/root/gccbuilder/glibc-2.20/resolv/ns_print.c:99: undefined reference to `__stack_chk_guard'
+
+Seems like stack guard is enabled in my linux. I have tried:
+sed -i '/k prot/agcc_cv_libc_provides_ssp=yes' gcc-4.9.2/configure
+then repeated the process again from step 1 but same error occurs.
+
+Any suggestion?
+Reply1 reply · active 367 weeks ago
+Joel Nider's avatar
+Joel Nider· 367 weeks ago
+
+Add these flags when configuring glibc:
+
+libc_cv_ssp=no libc_cv_ssp_strong=no
+
+It worked for me on powerpc64le platform.
+Reply
+Humberto's avatar
+Humberto· 362 weeks ago
+
+This is awsome!!! It helped me so much! I just built a cross-compiler for aarch64 which I intend to use for pine64. Thx for your help.
+Reply
+Maryam's avatar
+Maryam· 359 weeks ago
+
+Hi,
+I am a totally new linux and compiler learner. I need a cross compiler to compile my c program for a target machine with the following specifications.
+system type : Broadcom BCM5354 chip rev 3
+processor : 0
+cpu model : BCM3302 V2.9
+BogoMIPS : 238.38
+wait instruction : no
+microsecond timers : yes
+tlb_entries : 32
+
+I used your script to build a cross compiler, but I got the following error:
+........
+mv -f .deps/earmelfb.Tpo .deps/earmelfb.Po
+gcc -DHAVE_CONFIG_H -I. -I../../binutils-2.24/ld -I. -I../../binutils-2.24/ld -I../bfd -I../../binutils-2.24/ld/../bfd -I../../binutils-2.24/ld/../include -g -O2 -DENABLE_PLUGINS -DLOCALEDIR=""/opt/cross/share/locale"" -W -Wall -Wstrict-prototypes -Wmissing-prototypes -Wshadow -Werror -g -O2 -MT earmelfb_linux_eabi.o -MD -MP -MF .deps/earmelfb_linux_eabi.Tpo -c -o earmelfb_linux_eabi.o earmelfb_linux_eabi.c
+mv -f .deps/eaarch64linuxb.Tpo .deps/eaarch64linuxb.Po
+gcc -DHAVE_CONFIG_H -I. -I../../binutils-2.24/ld -I. -I../../binutils-2.24/ld -I../bfd -I../../binutils-2.24/ld/../bfd -I../../binutils-2.24/ld/../include -g -O2 -DENABLE_PLUGINS -DLOCALEDIR=""/opt/cross/share/locale"" -W -Wall -Wstrict-prototypes -Wmissing-prototypes -Wshadow -Werror -g -O2 -MT earmelf_linux_eabi.o -MD -MP -MF .deps/earmelf_linux_eabi.Tpo -c -o earmelf_linux_eabi.o earmelf_linux_eabi.c
+mv -f .deps/eaarch64linux32.Tpo .deps/eaarch64linux32.Po
+mv -f .deps/eaarch64linux32b.Tpo .deps/eaarch64linux32b.Po
+mv -f .deps/earmelfb_linux_eabi.Tpo .deps/earmelfb_linux_eabi.Po
+mv -f .deps/earmelf_linux_eabi.Tpo .deps/earmelf_linux_eabi.Po
+/bin/bash ./libtool --tag=CC --mode=link gcc -W -Wall -Wstrict-prototypes -Wmissing-prototypes -Wshadow -Werror -g -O2 -static-libstdc++ -static-libgcc -o ld-new ldgram.o ldlex-wrapper.o lexsup.o ldlang.o mri.o ldctor.o ldmain.o ldwrite.o ldexp.o ldemul.o ldver.o ldmisc.o ldfile.o ldcref.o plugin.o eaarch64linux.o eaarch64elf.o eaarch64elf32.o eaarch64elf32b.o eaarch64elfb.o earmelf.o earmelfb.o eaarch64linuxb.o eaarch64linux32.o eaarch64linux32b.o earmelfb_linux_eabi.o earmelf_linux_eabi.o ../bfd/libbfd.la ../libiberty/libiberty.a -lz -ldl
+libtool: link: gcc -W -Wall -Wstrict-prototypes -Wmissing-prototypes -Wshadow -Werror -g -O2 -static-libstdc++ -static-libgcc -o ld-new ldgram.o ldlex-wrapper.o lexsup.o ldlang.o mri.o ldctor.o ldmain.o ldwrite.o ldexp.o ldemul.o ldver.o ldmisc.o ldfile.o ldcref.o plugin.o eaarch64linux.o eaarch64elf.o eaarch64elf32.o eaarch64elf32b.o eaarch64elfb.o earmelf.o earmelfb.o eaarch64linuxb.o eaarch64linux32.o eaarch64linux32b.o earmelfb_linux_eabi.o earmelf_linux_eabi.o ../bfd/.libs/libbfd.a ../libiberty/libiberty.a -lz -ldl
+make[4]: Leaving directory `/home/maryam/cross-gcc/build-binutils/ld'
+make[3]: Leaving directory `/home/maryam/cross-gcc/build-binutils/ld'
+make[2]: Leaving directory `/home/maryam/cross-gcc/build-binutils/ld'
+make[1]: Leaving directory `/home/maryam/cross-gcc/build-binutils'
+make[1]: Entering directory `/home/maryam/cross-gcc/build-binutils'
+/bin/bash ../binutils-2.24/mkinstalldirs /opt/cross /opt/cross
+mkdir -p -- /opt/cross /opt/cross
+mkdir: cannot create directory ‘/opt/cross’: Permission denied
+mkdir: cannot create directory ‘/opt/cross’: Permission denied
+make[1]: *** [installdirs] Error 1
+make[1]: Leaving directory `/home/maryam/cross-gcc/build-binutils'
+make: *** [install] Error 2
+FAILED COMMAND: make install
+
+Could you please help me with this issue?
+Reply1 reply · active 353 weeks ago
+Rich Wicks's avatar
+Rich Wicks· 353 weeks ago
+
+The problem you have is you cannot write to /opt, I believe.
+
+Do this:
+
+$ whoami
+<You will get "your UID" here>
+$ sudo mkdir -p /opt/cross
+$ sudo chown "your UID" /opt/cross
+
+Your UID isn't probably "john", and your probably copied that verbatim.
+Reply
+Шегай Вячеслав's avatar - Go to profile
+Шегай Вячеслав· 355 weeks ago
+
+rewrote it with https://github.com/vyacheslavs/cross-compile
+
+thanks for great article
+Reply
+Vladimir Lebedev's avatar
+Vladimir Lebedev· 352 weeks ago
+
+It's interesting to know that there's a ready-made script for downloading dependencies right in gcc' source files: ./contrib/download_prerequisites. Found on http://stackoverflow.com/a/10339798
+Reply
+Richard Wicks's avatar
+Richard Wicks· 352 weeks ago
+
+What would really help is if you published the version of gcc you are using when you are compiling a x-compiler.
+
+Here's mine:
+
+$ gcc --version
+gcc (Ubuntu 5.3.1-14ubuntu2.1) 5.3.1 20160413
+Copyright (C) 2015 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions. There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+I would bet money you aren't using anything above 4.x
+
+There's a lot of known issues because of using -Werror in bin utils. This requires 12 patches from what I've found so far, but honestly, it's easier just to get the same version of gcc somebody else used.
+Reply
+JohnLondon's avatar
+JohnLondon· 347 weeks ago
+
+Thanks very much, that's really helpful. I used your post and script as the basis for a script that compiles a x86_64 GCC toolchain for use on OSX that will compile for Linux. Details are here: https://github.com/johnlondon/Cross-compile-toolc...
+Reply
+Satish Muniraju's avatar - Go to profile
+Satish Muniraju· 342 weeks ago
+
+Thanks. Your script saved me a lot time.
+Reply
+uray's avatar
+uray· 341 weeks ago
+
+thank you for the article, its really help me, but i have problem with last part of gcc compilation using
+
+these are the part of log that saying error
+
+libtool: compile: /rtos/test/build-gcc/./gcc/xgcc -B/rtos/test/build-gcc/./gcc/ -B/rtos/cross/x86_64-artos-linux/bin/ -B/rtos/cross/x86_64-artos-linux/lib/ -isystem /rtos/cross/x86_64-artos-linux/include -isystem /rtos/cross/x86_64-artos-linux/sys-include -DHAVE_CONFIG_H -I. -I../../../../gcc-6.2.0/libmpx/mpxrt -I.. -I../../../../gcc-6.2.0/libmpx/.. -fPIC -g -O2 -c ../../../../gcc-6.2.0/libmpx/mpxrt/mpxrt-utils.c -fPIC -DPIC -o .libs/libmpx_la-mpxrt-utils.o
+../../../../gcc-6.2.0/libmpx/mpxrt/mpxrt-utils.c:69:23: error: 'PATH_MAX' undeclared here (not in a function)
+#define MAX_FILE_NAME PATH_MAX
+^
+../../../../gcc-6.2.0/libmpx/mpxrt/mpxrt-utils.c:91:22: note: in expansion of macro 'MAX_FILE_NAME'
+static char out_name[MAX_FILE_NAME];
+^~~~~~~~~~~~~
+Makefile:390: recipe for target 'libmpx_la-mpxrt-utils.lo' failed
+make[4]: *** [libmpx_la-mpxrt-utils.lo] Error 1
+make[4]: Leaving directory '/rtos/test/build-gcc/x86_64-artos-linux/libmpx/mpxrt'
+Makefile:409: recipe for target 'all-recursive' failed
+make[3]: *** [all-recursive] Error 1
+make[3]: Leaving directory '/rtos/test/build-gcc/x86_64-artos-linux/libmpx'
+Makefile:300: recipe for target 'all' failed
+make[2]: *** [all] Error 2
+make[2]: Leaving directory '/rtos/test/build-gcc/x86_64-artos-linux/libmpx'
+Makefile:12473: recipe for target 'all-target-libmpx' failed
+make[1]: *** [all-target-libmpx] Error 2
+
+do you have any solution?
+my configuration are :
+
+USE_NEWLIB=0
+LINUX_ARCH=x86_64
+CONFIGURATION_OPTIONS="--disable-multilib --disable-nls --disable-rpath --disable-doc --without-selinux --disable-debug --disable-valgrind-tests --disable-documentation --disable-gtk-doc-pdf --disable-gtk-doc --disable-manpages --disable-gtk-doc-html --disable-tests" # --disable-threads --disable-shared
+PARALLEL_MAKE=-j4
+BINUTILS_VERSION=binutils-2.27
+GCC_VERSION=gcc-6.2.0
+LINUX_KERNEL_VERSION=linux-4.8.1
+GLIBC_VERSION=glibc-2.24
+MPFR_VERSION=mpfr-3.1.5
+GMP_VERSION=gmp-6.1.1
+MPC_VERSION=mpc-1.0.3
+ISL_VERSION=isl-0.17.1
+CLOOG_VERSION=cloog-0.18.4
+Reply1 reply · active 321 weeks ago
+abigagli's avatar - Go to profile
+abigagli· 321 weeks ago
+
+Hi, I've got your exact same problem while building on macOS a cross-gcc-6.3.0 targeting linux.
+I've not understood what the cause of the problem is, but at the end of the day I found that PATH_MAX is defined in <prefix>/<target>/include/linux/limits.h.
+Instead of trying to modify configure scripts or makefiles I did as follow:
+1) configure
+2) make
+3)... wait for build failure
+4) copied the command line that failed to compile
+5) cd into the directory where that command line is being issued (should be build-gcc/<target>/libmpx/mpxrt)
+6) paste the command line you copied in 4 and verify you're getting the same error (just to be sure you are in the correct folder as per point 5)
+7) if you are in the right folder, paste again the command line you copied in 4 but before pressing enter, edit it and add somewhere (e.g. after all the "-I<...>" flags) the following: "-include linux/limits.h"
+8) Now press enter and the compilation should succeed
+9) get back at the top of the build directory build-gcc and restart "make all"
+
+It seems more complicated than it really is. Basically you're just replacing the compilation command that fails with one that forces the inclusion of linux/limits.h without having to change any source/configure/Makefile. The disadvantage is that you'll have to repeat this if you build again from scratch.
+Unfortunately, I'm not sure it is the right thing to do, as I have not understood where the problem is coming from, but it seems to be working for me.
+Hope this helps
+Reply
+Jay's avatar
+Jay· 336 weeks ago
+
+Has anyone been able to modify this procedure to work with --with-sysroot (which I believe is required for making toolchains for buildroot)?
+
+Depending on the exact method I try I get different errors, but the most successful version (the one that gets to the final build step) ends up failing during linking because ld appends the sysroot to the path of libc but then looks for that in the prefix location (or something like that, I am not at work and I dont exactly remeber what goes wrong).
+Reply1 reply · active 329 weeks ago
+bartek's avatar
+bartek· 329 weeks ago
+
+add to binutils --with-sysroot=$MYSYSROOT (works but i did not found it in configure --help binutils)
+Reply
+Gooby's avatar
+Gooby· 329 weeks ago
+
+Great post! It actually helped me to understand a lot of things. Even if I messed with other specific distro, this overview gave me really strong background and clear steps how to proceed.
+PS. I like pancakes! =)
+Reply
+Kiran's avatar
+Kiran· 328 weeks ago
+
+Thanks. The article is very helpful. Is it possible to give bit more clarity on "--target=aarch64-linux" used while configuring binutils ? For e.g. why it didn't become "--target=arm64-linux" or any thing else. A bit more explanation their will help people when they should configure binutils/gcc for their own architectures.
+
+I am looking to build gccgo cross compiler for Intel Galelio ( x86-linux but doesn't support MMX instruction set ). GCC options page ( https://gcc.gnu.org/onlinedocs/gcc-4.9.2/gcc/i386... ) asks to provide -march=i586( for no MMX ). But I am not sure what to use while configuring binutils / gcc as the "--target=?" entry.
+Reply
+Ivan Castell's avatar
+Ivan Castell· 324 weeks ago
+
+Thank you for this post, it clarified some ideas and helped me to understand the full process a lot. I am building some toolchains for different MIPS, ARM and x86 platforms, and along the process I learned that some parameters you use to setup triplet depend on the target platform, and on the used C library. For example you need to define an ABI (eabi, oabi) suffix in ARM, but you don't need this suffix in MIPS. I think it would be very helpful if community worked together building a big table showing all the different platforms and options you need to setup to build a toolchain it. The whole building process would be very easy to automate.
+Reply
+Sumit's avatar
+Sumit· 323 weeks ago
+
+Thanks for the guide.
+While compiling binutils, I have used below commands:
+
+$ mkdir build-binutils
+$ cd build-binutils
+$ ../binutils-2013.11/configure --target=powerpc-wrs-vxworks --prefix=/opt/cross --program-suffix=ppc --enable-threads=vxworks --with-cpu=603 --with-arch=603
+$ make -j4
+$ make install
+
+But I am getting error while executing "make install"
+onx-sbansal-01|~/Downloads/build-binutils$ make install
+make[1]: Entering directory `/home/sbansal/Downloads/build-binutils'
+/bin/sh ../binutils-2013.11/mkinstalldirs /opt/cross /opt/cross
+make[2]: Entering directory `/home/sbansal/Downloads/build-binutils/bfd'
+make[2]: *** No rule to make target `install'. Stop.
+make[2]: Leaving directory `/home/sbansal/Downloads/build-binutils/bfd'
+make[1]: *** [install-bfd] Error 2
+make[1]: Leaving directory `/home/sbansal/Downloads/build-binutils'
+Reply
+Sumit's avatar
+Sumit· 323 weeks ago
+
+While configuring the glibc, I am seeing below problem.
+"The GNU C library is currently not available for this platform."
+Can somebody help?
+
+onx-sbansal-01|~/Downloads/build-glibc$ ../glibc-2.20/configure --prefix=/opt/cross/powerpc-wrs-vxworks --build=$MACHTYPE --host=powerpc-wrs-vxworks --target=powerpc-wrs-vxworks --disable-multilib libc_cv_forced_unwind=yes
+checking build system type... x86_64-redhat-linux-gnu
+checking host system type... powerpc-wrs-vxworks
+checking for powerpc-wrs-vxworks-gcc... no
+checking for gcc... gcc
+configure: WARNING: using cross tools not prefixed with host triplet
+checking for suffix of object files... o
+checking whether we are using the GNU C compiler... yes
+checking whether gcc accepts -g... yes
+checking for gcc... gcc
+checking for powerpc-wrs-vxworks-g++... no
+checking for powerpc-wrs-vxworks-c++... no
+checking for powerpc-wrs-vxworks-gpp... no
+checking for powerpc-wrs-vxworks-aCC... no
+checking for powerpc-wrs-vxworks-CC... no
+checking for powerpc-wrs-vxworks-cxx... no
+checking for powerpc-wrs-vxworks-cc++... no
+checking for powerpc-wrs-vxworks-cl.exe... no
+checking for powerpc-wrs-vxworks-FCC... no
+checking for powerpc-wrs-vxworks-KCC... no
+checking for powerpc-wrs-vxworks-RCC... no
+checking for powerpc-wrs-vxworks-xlC_r... no
+checking for powerpc-wrs-vxworks-xlC... no
+checking for g++... g++
+checking whether we are using the GNU C++ compiler... yes
+checking whether g++ accepts -g... yes
+checking for powerpc-wrs-vxworks-readelf... no
+checking for readelf... readelf
+checking for sysdeps preconfigure fragments... aarch64 alpha arm hppa i386 m68k microblaze mips powerpc s390 sh sparc tile x86_64
+configure: running configure fragment for add-on libidn
+*** The GNU C library is currently not available for this platform.
+*** So far nobody cared to port it and if there is no volunteer it
+*** might never happen. So, if you have interest to see glibc on
+*** this platform visit
+** *http://www.gnu.org/software/libc/porting.html
+*** and join the group of porters
+Reply
+Henning's avatar
+Henning· 315 weeks ago
+
+Thanks for this great guide!
+
+I've managed to build a mingw-w64 toolchain (for building 32-bit windows binaries) on armv7h following this guide, using i686-w64-mingw32 as the target architecture.
+
+I skipped step 2 (kernal headers) and replaced step 4 (glibc) with mingw-w64-5.0.2. I had trouble building in a separate build dir, so I just build in the source tree:
+
+cd mingw-w64-5.0.2
+./configure --prefix=/opt/cross/i686-w64-mingw32 --host=i686-w64-mingw32 --enable-wildcard --enable-shared --enable-lib32 --disable-lib64 --disable-arm64
+make -j4
+make install
+cd ..
+
+If you want to be able to build 64bit windows binaries, using "x86_64-w64-mingw32" as architecture should do the trick.
+Reply
+bem's avatar
+bem· 315 weeks ago
+
+After make -j4 I get the following error:
+
+cc1: all warnings being treated as errors
+Makefile:891: recipe for target 'subsegs.o' failed
+make[4]: *** [subsegs.o] Error 1
+make[4]: *** Waiting for unfinished jobs....
+mv -f .deps/stabs.Tpo .deps/stabs.Po
+mv -f .deps/read.Tpo .deps/read.Po
+mv -f .deps/symbols.Tpo .deps/symbols.Po
+make[4]: Leaving directory '/home/iiitd/Desktop/crosscompiler/build-binutils/gas'
+Makefile:2165: recipe for target 'all-recursive' failed
+make[3]: *** [all-recursive] Error 1
+make[3]: Leaving directory '/home/iiitd/Desktop/crosscompiler/build-binutils/gas'
+Makefile:682: recipe for target 'all' failed
+make[2]: *** [all] Error 2
+make[2]: Leaving directory '/home/iiitd/Desktop/crosscompiler/build-binutils/gas'
+Makefile:4710: recipe for target 'all-gas' failed
+make[1]: *** [all-gas] Error 2
+make[1]: Leaving directory '/home/iiitd/Desktop/crosscompiler/build-binutils'
+Makefile:830: recipe for target 'all' failed
+make: *** [all] Error 2
+
+Can anybody help?
+Reply
+Thorsten 's avatar
+Thorsten· 309 weeks ago
+
+Thanks for the great work!
+
+I tried to get a crosschain working for a long time and failed.
+
+This helps a lot!
+Reply
+bramankp's avatar
+bramankp· 307 weeks ago
+
+Tried using this procedure and it looks like everything works perfectly except that the GCC (4.9.4) installation doesn't create the correct limits.h file. The file that ends up in ${PREFIX}/lib/gcc/i686-redhat-linux/4.9.4/include-fixed/limits.h doesn't contain the section that *then* includes syslimits.h. There's a spot in the source code where it's checking for "fixincludes" or whatever they are called internally but it doesn't seem to detect that the Glibc 2.11.3 system header files and Linux Kernel 2.6.35.9 headers properly (via the #include_next directive in syslimits.h).
+
+Anyone familiar with why the "system header files" aren't getting detected when I follow this procedure?
+Reply1 reply · active 307 weeks ago
+bramankp's avatar
+bramankp· 307 weeks ago
+
+As evidence of the problem I am trying to resolve, I took the build script reference in this article, changed the PREFIX directory to something else (no other changes output fixing a wget of the kernel source because of a certificate check issue) and tried compiling the following two-line C file:
+
+#include <limits.h>
+int main() { return NAME_MAX; }
+
+It doesn't build. It says NAME_MAX is undefined.
+Reply
+Colt Morris's avatar
+Colt Morris· 304 weeks ago
+
+I just wanted to say thanks for creating and posting this.
+I was able to successfully complete the build (targeting aarch64) on a raspberry pi over a few days (it could have been faster if I scripted it instead of typing commands manually) after about a week of my own failed attempts.
+How on earth did you manage to figure this out in the first place (before this resource existed)?
+Packages used: binutils 2.28, gcc 4.9.2, gmp 4.3.2, mpc 0.8.1, mpfr 2.4.2, linux 3.17.2, and glibc 2.20.
+I omitted isl and cloog because they're optional, I have limited disk space, and they may have been causing problems in an earlier attempt.
+Pi users: it may help to always specify the --host and --build options explicitly since, at least for me, binutils and gcc had a penchant for guessing wrong. As to the value to use, there's a subdirectory of /lib whose name is your triplet, gcc -dumpmachine for your native compiler, or $MACHTYPE should all give you the right triplet.
+Reply1 reply · active 304 weeks ago
+preshing's avatar - Go to profile
+preshing· 304 weeks ago
+
+It took me several days too. I looked at existing (older) guides and used a lot of trial and error to figure things out. Studying Crosstool (http://crosstool-ng.github.io/) helped a lot, though their AArch64 support wasn't perfect at the time. It's probably improved now.
+Reply
+ybr's avatar
+ybr· 303 weeks ago
+
+I'm tying to do the same but for arm-linux-gnueabihf,
+I got stuck on step 7, while tying to compile c++ libs, I'm getting this error after running 'make -j4':
+'checking dynamic linker characteristics... configure: error: Link tests are not allowed after GCC_NO_EXECUTABLES.'
+'configure-target-libssp' failed
+
+please advise...
+Reply
+jim's avatar
+jim· 248 weeks ago
+
+Everything worked up to and including step3.
+But in step 4 while trying to configure the glibc, I get the following error
+
+checking whether __attribute__((visibility())) is supported... no
+configure: error: compiler support for visibility attribute is required
+
+I made sever guesses, modified the config file manually, searched the web for hours to no avail.
+For the test, I added libc_cv_visibility_attribute=no but it did not help.
+What I found out is that if I omit the --host=..... option, it configures without this message. But then the configuration is obviously not the one we are looking for :-)
+
+Any idea anyone?
+thanks for your time.
+Reply
+Check out Plywood, a cross-platform, open source C++ framework:
+
+
+Recent Posts
+How C++ Resolves a Function Call
+Flap Hero Code Review
+A Small Open Source Game In C++
+Automatically Detecting Text Encodings in C++
+I/O in Plywood
+A New Cross-Platform Open Source C++ Framework
+A Flexible Reflection System in C++: Part 2
+A Flexible Reflection System in C++: Part 1
+How to Write Your Own C++ Game Engine
+Can Reordering of Release/Acquire Operations Introduce Deadlock?
+Here's a Standalone Cairo DLL for Windows
+Learn CMake's Scripting Language in 15 Minutes
+How to Build a CMake-Based Project
+Using Quiescent States to Reclaim Memory
+Leapfrog Probing
+A Resizable Concurrent Map
+New Concurrent Hash Maps for C++
+You Can Do Any Kind of Atomic Read-Modify-Write Operation
+Safe Bitfields in C++
+Semaphores are Surprisingly Versatile
+Copyright © 2021 Jeff Preshing - Powered by Octopress
