@@ -13,3 +13,4 @@ My ARM study
 
 ## How to Build a GCC Cross-Compiler  
 * https://preshing.com/20141119/how-to-build-a-gcc-cross-compiler/  
+* https://github.com/OpenNoah/toolchain/blob/master/Makefile  
