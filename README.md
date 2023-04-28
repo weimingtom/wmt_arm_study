@@ -10,3 +10,6 @@ My ARM study
 
 ## bpi d1, arm9  
 * https://wiki.banana-pi.org/Banana_PI_D1  
+
+## How to Build a GCC Cross-Compiler  
+* https://preshing.com/20141119/how-to-build-a-gcc-cross-compiler/  
