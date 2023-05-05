@@ -14,3 +14,9 @@ My ARM study
 ## How to Build a GCC Cross-Compiler  
 * https://preshing.com/20141119/how-to-build-a-gcc-cross-compiler/  
 * https://github.com/OpenNoah/toolchain/blob/master/Makefile  
+
+## buildroot-armv7  
+* https://github.com/digiampietro/buildroot-armv7  
+
+## 使用QEMU模拟搭建ARM开发平台（三）——添加SCSI和MTD以及NAND flash支持  
+* https://blog.csdn.net/tycoon1988/article/details/46532283  
